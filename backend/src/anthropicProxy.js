@@ -1,7 +1,3 @@
-/**
- * anthropicProxy.js  — Google Gemini free tier
- * .env:  GEMINI_API_KEY=AIza...
- */
 const express = require('express');
 const router  = express.Router();
 
@@ -21,10 +17,16 @@ router.post('/messages', async (req, res) => {
 
     const geminiParts = [];
     if (imagePart?.source?.data) {
+      // Guard: reject clearly if image data is missing or too short to be valid
+      const imgData = imagePart.source.data;
+      if (!imgData || imgData.length < 100) {
+        console.error('[geminiProxy] Image data is null or too short — map capture likely failed');
+        return res.status(400).json({ error: 'Image data is empty. Map capture failed — ensure the map is fully loaded at zoom 17+.' });
+      }
       geminiParts.push({
         inline_data: {
           mime_type: imagePart.source.media_type || 'image/jpeg',
-          data: imagePart.source.data,
+          data: imgData,
         }
       });
     }

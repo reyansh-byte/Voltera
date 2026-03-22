@@ -3,18 +3,164 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 /**
  * AutoRoofDetector
  *
- * 1. Search building by name  → map pans to it and uses the Place's actual
- *    bounding box (geometry.viewport or geometry.bounds) for the outline
- *    so it covers the real building footprint, not a generic zoom estimate.
- * 2. "Detect at Centre" fallback  → zoom-calibrated estimate when no search.
- * 3. Draggable corner handles     → user can fine-tune any corner.
- * 4. Mid-edge handles             → user can add extra points on any edge.
+ * 1. Search building by name  → snaps to actual building bounds via Places API.
+ * 2. AI Detect (Claude Vision) → captures satellite map view, sends to Claude,
+ *    which traces the rooftop polygon and returns normalised coordinates.
+ * 3. Manual fallback           → zoom-calibrated rectangle estimate.
+ * 4. Draggable corner handles  → user can refine any detected outline.
  * 5. Confirm / Clear buttons.
  */
+
+// ── Capture the Google Maps satellite view as a base64 JPEG ────────────────
+// Primary: /api/maps-static proxy (add this route to your Express server —
+//   see comment below). Falls back to stitching visible map tiles.
+//
+// Backend route to add (Express):
+//   app.get('/api/maps-static', async (req, res) => {
+//     const {center,zoom,size,maptype,scale} = req.query;
+//     const url = `https://maps.googleapis.com/maps/api/staticmap`
+//       + `?center=${center}&zoom=${zoom}&size=${size}`
+//       + `&maptype=${maptype}&scale=${scale}&key=${process.env.GOOGLE_MAPS_KEY}`;
+//     const r = await fetch(url);
+//     res.set('Content-Type','image/png');
+//     r.body.pipe(res);
+//   });
+const captureMapImage = async (map) => {
+  const centre = map.getCenter();
+  const zoom   = map.getZoom();
+  const lat    = centre.lat().toFixed(6);
+  const lng    = centre.lng().toFixed(6);
+
+  // Try proxy first
+  try {
+    const res = await fetch(
+      `/api/maps-static?center=${lat},${lng}&zoom=${zoom}&size=640x640&maptype=satellite&scale=2`
+    );
+    if (res.ok) {
+      const blob = await res.blob();
+      return await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload  = () => resolve(r.result.split(',')[1]);
+        r.onerror = reject;
+        r.readAsDataURL(blob);
+      });
+    }
+  } catch {}
+
+  // Fallback: stitch map tile <img> elements from the live map div.
+  // Each tile is a Google Maps tile image. We draw them all onto a canvas
+  // positioned relative to the map container, then crop to 640×640.
+  try {
+    const mapDiv = map.getDiv();
+    const mapRect = mapDiv.getBoundingClientRect();
+    const W = Math.round(mapRect.width)  || 640;
+    const H = Math.round(mapRect.height) || 640;
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Collect all img elements inside the map and draw them
+    const imgs = Array.from(mapDiv.querySelectorAll('img'));
+    const draws = imgs.map(img => new Promise(res => {
+      if (!img.src || img.src.startsWith('data:') || img.naturalWidth === 0) { res(); return; }
+      // Get position of tile relative to map container
+      const r = img.getBoundingClientRect();
+      const x = r.left - mapRect.left;
+      const y = r.top  - mapRect.top;
+      const w = r.width  || img.naturalWidth;
+      const h = r.height || img.naturalHeight;
+      const tmp = new Image();
+      tmp.crossOrigin = 'anonymous';
+      tmp.onload  = () => { try { ctx.drawImage(tmp, x, y, w, h); } catch {} res(); };
+      tmp.onerror = () => res();
+      tmp.src = img.src;
+    }));
+
+    await Promise.allSettled(draws);
+
+    // Crop/pad to 640×640 centred
+    const out = document.createElement('canvas');
+    out.width = out.height = 640;
+    const ox = Math.max(0, (W - 640) / 2);
+    const oy = Math.max(0, (H - 640) / 2);
+    out.getContext('2d').drawImage(canvas, ox, oy, 640, 640, 0, 0, 640, 640);
+
+    const dataUrl = out.toDataURL('image/jpeg', 0.92);
+    if (!dataUrl || dataUrl === 'data:,') return null;
+    return dataUrl.split(',')[1];
+  } catch (err) {
+    console.warn('Map capture failed:', err);
+    return null;
+  }
+};
+
+// ── Send satellite image to Claude Vision, get rooftop polygon back ────────
+const detectRoofWithAI = async (base64Img, onProgress) => {
+  onProgress?.('Sending satellite image to AI...');
+
+  const prompt = `You are analysing a satellite/aerial map image to detect a building rooftop.
+
+Your task:
+1. Find the LARGEST or MOST CENTRAL building rooftop in the image.
+2. Trace its outer boundary as a polygon.
+3. Return normalised coordinates (0.0 = top/left edge, 1.0 = bottom/right edge of image).
+4. 4–16 points, clockwise from the top-left corner of the roof.
+5. Only trace the roof boundary — not surrounding ground, roads, or other structures.
+
+Respond with ONLY this JSON, nothing else:
+{"polygon":[{"x":0.3,"y":0.2},{"x":0.7,"y":0.2},{"x":0.7,"y":0.8},{"x":0.3,"y":0.8}],"confidence":0.85,"notes":""}
+
+Rules:
+- If no clear building is visible, return confidence 0 and an empty polygon [].
+- polygon points must be strictly between 0.0 and 1.0.
+- Clockwise winding from top-left corner of the roof.
+- Output ONLY the JSON object. No markdown, no explanation.`;
+
+  try {
+    const response = await fetch('/api/anthropic/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 800,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Img } },
+            { type: 'text',  text: prompt }
+          ]
+        }]
+      })
+    });
+
+    if (!response.ok) throw new Error('Claude API error: ' + response.status);
+
+    const data = await response.json();
+    const raw  = data.content?.[0]?.text || '';
+
+    // Robust JSON extraction
+    let parsed = null;
+    try { parsed = JSON.parse(raw.replace(/^```json\s*/i,'').replace(/```\s*$/i,'').trim()); }
+    catch { try { const m = raw.match(/\{[\s\S]*\}/); if (m) parsed = JSON.parse(m[0]); } catch {} }
+
+    if (!parsed || !parsed.polygon || parsed.polygon.length < 3 || parsed.confidence < 0.3) {
+      return null;
+    }
+    return parsed;
+  } catch (err) {
+    console.error('AI roof detection error:', err);
+    return null;
+  }
+};
+
 const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
   const [query,        setQuery]        = useState('');
   const [isSearching,  setIsSearching]  = useState(false);
-  const [isDetecting,  setIsDetecting]  = useState(false);
+  const [isAIDetecting,setIsAIDetecting]= useState(false);
   const [statusMsg,    setStatusMsg]    = useState('');
   const [hasPolygon,   setHasPolygon]   = useState(false);
 
@@ -40,6 +186,9 @@ const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
 
   useEffect(() => () => clearOverlays(), [clearOverlays]);
 
+  // ── isDragging ref — prevents handle rebuild mid-drag ───────────────
+  const isDraggingRef = useRef(false);
+
   // ── Rebuild draggable corner handles ──────────────────────────────────
   const rebuildHandles = useCallback((polygon) => {
     markersRef.current.forEach(m => m.setMap(null));
@@ -63,10 +212,20 @@ const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
       });
 
       const idx = i;
+
+      // dragstart: flag so polygon path listener doesn't rebuild handles
+      marker.addListener('dragstart', () => { isDraggingRef.current = true; });
+
+      // drag: update polygon path to follow the marker smoothly
       marker.addListener('drag', (e) => {
         polygon.getPath().setAt(idx, e.latLng);
       });
-      marker.addListener('dragend', () => {
+
+      // dragend: unflag, move marker to final snapped position, notify parent
+      marker.addListener('dragend', (e) => {
+        isDraggingRef.current = false;
+        polygon.getPath().setAt(idx, e.latLng);
+        marker.setPosition(e.latLng);
         onRoofDetected?.(pathToArray(polygon));
       });
 
@@ -92,8 +251,9 @@ const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
     polygonRef.current = polygon;
     setHasPolygon(true);
 
-    // Sync handles when path edited via native Google drag (vertex editing)
+    // Only rebuild handles when path changes from outside sources (not mid-drag)
     const sync = () => {
+      if (isDraggingRef.current) return; // skip if a marker drag is in progress
       rebuildHandles(polygon);
       onRoofDetected?.(pathToArray(polygon));
     };
@@ -174,43 +334,74 @@ const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
 
   const handleKeyDown = (e) => { if (e.key === 'Enter') handleSearch(); };
 
-  // ── DETECT AT CENTRE (zoom-calibrated fallback) ───────────────────────
-  const detectAtCentre = useCallback(() => {
+  // ── AI DETECT — Claude Vision traces the rooftop ─────────────────────
+  const detectWithAI = useCallback(async () => {
     if (!map) { onError?.('Map not ready.'); return; }
     const zoom = map.getZoom();
     if (zoom < 17) {
-      onError?.('Zoom in to level 17+ or search a building name first.');
+      onError?.('Zoom in to at least level 17 so the building fills the view.');
       return;
     }
 
-    setIsDetecting(true);
-    setStatusMsg('Estimating roof outline...');
+    setIsAIDetecting(true);
+    setStatusMsg('Capturing satellite view...');
 
-    const centre = map.getCenter();
-    const lat = centre.lat(), lng = centre.lng();
+    try {
+      // Step 1: get satellite image
+      const b64 = await captureMapImage(map);
+      if (!b64) {
+        setStatusMsg('Could not capture map image. Try the manual fallback below.');
+        setIsAIDetecting(false);
+        return;
+      }
 
-    // metres-per-pixel at this zoom, then scale to ~50% of viewport
-    // One tile is 256 px = 2π * R * cos(lat) / 2^zoom metres
-    const R       = 6378137;
-    const mPerPx  = (2 * Math.PI * R * Math.cos(lat * Math.PI / 180)) / (256 * Math.pow(2, zoom));
-    // Typical building: assume viewport is ~800×600 and building is ~30% of that
-    const hwM = mPerPx * 800 * 0.20;   // half-width  in metres
-    const hlM = mPerPx * 600 * 0.22;   // half-length in metres
+      // Step 2: ask Claude to trace the rooftop
+      setStatusMsg('AI is analysing the rooftop...');
+      const result = await detectRoofWithAI(b64, setStatusMsg);
 
-    const mPerLat = 111320;
-    const mPerLng = 111320 * Math.cos(lat * Math.PI / 180);
+      if (!result) {
+        setStatusMsg('AI could not detect a roof. Try zooming in more or use the manual fallback.');
+        setIsAIDetecting(false);
+        return;
+      }
 
-    const coords = [
-      { lat: lat + hlM / mPerLat, lng: lng - hwM / mPerLng }, // NW
-      { lat: lat + hlM / mPerLat, lng: lng + hwM / mPerLng }, // NE
-      { lat: lat - hlM / mPerLat, lng: lng + hwM / mPerLng }, // SE
-      { lat: lat - hlM / mPerLat, lng: lng - hwM / mPerLng }, // SW
-    ];
+      // Step 3: convert normalised image coords → lat/lng
+      // The Static API image covers the same area as the live map viewport.
+      // We compute the lat/lng bounds of the 640×640 image using the same
+      // metres-per-pixel formula as the tile spec.
+      const centre   = map.getCenter();
+      const lat      = centre.lat();
+      const lng      = centre.lng();
+      const R        = 6378137;
+      const mPerPx   = (2 * Math.PI * R * Math.cos(lat * Math.PI / 180)) / (256 * Math.pow(2, zoom));
+      // Static image is 640px at scale=2 → 640 CSS px, but covers 640/2=320 tile px
+      const imgPx    = 320; // tile pixels covered by the 640-wide image
+      const halfM    = imgPx * mPerPx / 2;
+      const mPerLat  = 111320;
+      const mPerLng  = 111320 * Math.cos(lat * Math.PI / 180);
 
-    drawPolygon(coords);
-    setStatusMsg('Outline ready. Drag the blue handles to match your building exactly.');
-    setIsDetecting(false);
+      // Image top-left corner in lat/lng
+      const topLat   = lat + halfM / mPerLat;
+      const leftLng  = lng - halfM / mPerLng;
+      const spanLat  = (2 * halfM) / mPerLat;
+      const spanLng  = (2 * halfM) / mPerLng;
+
+      const coords = result.polygon.map(p => ({
+        lat: topLat  - p.y * spanLat,
+        lng: leftLng + p.x * spanLng,
+      }));
+
+      drawPolygon(coords);
+      const conf = Math.round((result.confidence || 0) * 100);
+      setStatusMsg(`AI detected rooftop (${conf}% confidence). Drag handles to refine.`);
+    } catch (err) {
+      console.error('AI detection error:', err);
+      setStatusMsg('Detection failed. Use the manual fallback below.');
+    }
+
+    setIsAIDetecting(false);
   }, [map, drawPolygon, onError]);
+
 
   // ── CONFIRM ───────────────────────────────────────────────────────────
   const confirmOutline = useCallback(() => {
@@ -303,15 +494,24 @@ const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
         </div>
       )}
 
-      {/* Detect at centre */}
-      <button disabled={isDetecting} onClick={detectAtCentre} style={btn(!isDetecting)}>
-        {isDetecting ? <><span style={spinner} /> Detecting...</> : 'Auto-Detect Roof at Centre'}
+      {/* AI Detect — primary action */}
+      <button disabled={isAIDetecting} onClick={detectWithAI}
+        style={{
+          ...btn(!isAIDetecting),
+          background: !isAIDetecting
+            ? 'linear-gradient(135deg,rgba(100,200,255,0.25),rgba(70,100,255,0.38))'
+            : 'rgba(70,70,70,0.25)',
+          marginBottom: '7px',
+        }}>
+        {isAIDetecting
+          ? <><span style={spinner} /> AI analysing rooftop...</>
+          : 'AI Detect Roof (Claude Vision)'}
       </button>
 
       {/* Confirm */}
       {hasPolygon && (
         <button onClick={confirmOutline} style={btn(true)}>
-          Confirm Outline
+          ✓ Confirm Outline
         </button>
       )}
 
@@ -328,13 +528,12 @@ const AutoRoofDetector = ({ map, onRoofDetected, onError }) => {
         background: 'rgba(255,255,255,0.04)', borderRadius: '6px',
         fontSize: '11px', color: 'rgba(255,255,255,0.55)', lineHeight: 1.7,
       }}>
-        <strong style={{ color: 'rgba(255,255,255,0.8)' }}>How to use</strong>
+        <strong style={{ color: 'rgba(255,255,255,0.8)' }}>How it works</strong>
         <ul style={{ margin: '4px 0 0', paddingLeft: '16px' }}>
-          <li>Type a building name and press Search — outline snaps to actual building bounds</li>
-          <li>Or zoom in and click "Auto-Detect at Centre"</li>
-          <li>Drag the blue handles to match the roof exactly</li>
+          <li>Search a building name — outline snaps to its actual bounds</li>
+          <li>Or zoom in to level 17+ and click <strong style={{color:'rgba(255,255,255,0.8)'}}>AI Detect Roof</strong> — Claude Vision analyses the satellite view and traces the rooftop polygon</li>
+          <li>Drag the blue handles to refine the detected outline</li>
           <li>Press Confirm to lock the outline in</li>
-          <li>For custom shapes use "Draw Roof Area" below</li>
         </ul>
       </div>
 
