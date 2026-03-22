@@ -464,18 +464,53 @@ const buildFromBlueprint = (bp, mats, scene) => {
   // The clean rectangular outer perimeter looks correct for all roof types.
   // Walls added after roof is built so they can match eave height dynamically
 
-  const addChimneys = (ridgeY) => {
-    (bp.features?.chimneys || []).forEach((_, i) => {
-      const xs = footprint.map(p => p.x), zs = footprint.map(p => p.z);
-      const ratio = (i + 1) / ((bp.features.chimneys.length) + 1);
-      const ch = new THREE.Mesh(new THREE.BoxGeometry(0.7, 2.5, 0.7), mats.chimney);
-      ch.position.set(
-        Math.min(...xs) + (Math.max(...xs) - Math.min(...xs)) * ratio,
-        ridgeY + 1.0,
-        (Math.min(...zs) + Math.max(...zs)) / 2
+  // chimneyFPs: footprint polygons of each chimney for panel exclusion
+  const chimneyFPs = [];
+
+  const addChimneys = (ridgeY, roofInfo = null) => {
+    (bp.features?.chimneys || []).forEach((ch) => {
+      // ch now has {x, y, width, length} in real-world feet — use directly.
+      // Fall back to evenly-spaced if position not available (AI mode).
+      const FTc = 0.3048;
+      let cx, cz, cw, cl;
+      if (ch.x != null && ch.y != null) {
+        // Manual mode: convert from feet (polygon-space) to metres
+        const allXs = footprint.map(p => p.x), allZs = footprint.map(p => p.z);
+        const bMinX = Math.min(...allXs), bMinZ = Math.min(...allZs);
+        const bW = Math.max(...allXs) - bMinX, bL = Math.max(...allZs) - bMinZ;
+        cx = bMinX + (ch.x / (bp.dimensions?.width  || 60)) * bW;
+        cz = bMinZ + (ch.y / (bp.dimensions?.length || 60)) * bL;
+        cw = Math.max((ch.width  || 2) * FTc, 0.5);
+        cl = Math.max((ch.length || 2) * FTc, 0.5);
+      } else {
+        // AI mode fallback: evenly space along centre of building
+        const xs = footprint.map(p => p.x), zs = footprint.map(p => p.z);
+        const idx = (bp.features.chimneys || []).indexOf(ch);
+        const total = (bp.features.chimneys || []).length;
+        const ratio = (idx + 1) / (total + 1);
+        cx = Math.min(...xs) + (Math.max(...xs) - Math.min(...xs)) * ratio;
+        cz = (Math.min(...zs) + Math.max(...zs)) / 2;
+        cw = 0.7; cl = 0.7;
+      }
+
+      // Sit on the actual roof surface at this x/z position
+      const chH = 1.2;
+      const roofBase = roofInfo ? roofInfo.surfaceY(cx, cz) : ridgeY;
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(cw, chH, cl), mats.chimney
       );
-      ch.castShadow = true;
-      scene.add(ch);
+      // Position so bottom of chimney is at roof surface, top sticks up
+      mesh.position.set(cx, roofBase + chH / 2, cz);
+      mesh.castShadow = true;
+      scene.add(mesh);
+
+      // Register as a panel exclusion zone (footprint polygon)
+      chimneyFPs.push([
+        { x: cx - cw/2, z: cz - cl/2 },
+        { x: cx + cw/2, z: cz - cl/2 },
+        { x: cx + cw/2, z: cz + cl/2 },
+        { x: cx - cw/2, z: cz + cl/2 },
+      ]);
     });
   };
 
@@ -490,8 +525,8 @@ const buildFromBlueprint = (bp, mats, scene) => {
   } else if (isGable) {
     const roofInfo = addGableRoof(footprint, wallH, roofPitch, mats, scene);
     addWalls(footprint, wallH, mats.wall, scene, roofInfo.surfaceY);
-    addChimneys(roofInfo.ridgeY);
-    panelCount = placePanelsGable(roofInfo, wallH, [], mats.panel, scene);
+    addChimneys(roofInfo.ridgeY, roofInfo);
+    panelCount = placePanelsGable(roofInfo, wallH, chimneyFPs, mats.panel, scene);
     return { panelCount, roofSurfaceY: roofInfo.ridgeY };
 
   } else {
@@ -524,8 +559,8 @@ const buildFromBlueprint = (bp, mats, scene) => {
 
     const roofInfo = addHipRoof(footprint, wallH, roofPitch, mats, scene, userRidgeLines);
     addWalls(footprint, wallH, mats.wall, scene, roofInfo.surfaceY);
-    addChimneys(roofInfo.ridgeY);
-    panelCount = placePanelsHip(roofInfo, wallH, [], mats.panel, scene);
+    addChimneys(roofInfo.ridgeY, roofInfo);
+    panelCount = placePanelsHip(roofInfo, wallH, chimneyFPs, mats.panel, scene);
     return { panelCount, roofSurfaceY: roofInfo.ridgeY };
   }
 };
@@ -590,7 +625,6 @@ const buildFromMapPolygon = (roofPolygon, obstacles, mats, scene, ridgeLines = [
   }));
 
   const roofInfo = addHipRoof(footprint, WALL_H, 0.2, mats, scene, ridgeSegs);
-  // Walls grow dynamically to meet the roof eave at each edge
   addWalls(footprint, WALL_H, mats.wall, scene, roofInfo.surfaceY);
   const panelCount = placePanelsHip(roofInfo, WALL_H, obsFPs, mats.panel, scene);
   return { panelCount, roofSurfaceY: roofInfo.ridgeY };
@@ -648,6 +682,8 @@ const EnhancedSolarPanel3D = ({ blueprintData, roofPolygon, obstacles, ridgeLine
   const [panelCount,    setPanelCount]    = useState(0);
   const [totalCapacity, setTotalCapacity] = useState(0);
   const [buildingInfo,  setBuildingInfo]  = useState(null);
+  const [skylightCount, setSkylightCount] = useState(0);
+  const [ventCount,     setVentCount]     = useState(0);
   const [error,         setError]         = useState(null);
   const [pdfGenerating, setPdfGenerating] = useState(false);
 
@@ -655,6 +691,7 @@ const EnhancedSolarPanel3D = ({ blueprintData, roofPolygon, obstacles, ridgeLine
     if (!show3D || !mountRef.current) return;
     const mount = mountRef.current;
     setError(null); setPanelCount(0); setTotalCapacity(0); setBuildingInfo(null);
+    setSkylightCount(0); setVentCount(0);
 
     let renderer, controls, animId;
 
@@ -707,6 +744,8 @@ const EnhancedSolarPanel3D = ({ blueprintData, roofPolygon, obstacles, ridgeLine
           dimensions: blueprintData.dimensions   || null,
           pitch:      blueprintData.roofPitchNotation || null,
         });
+        setSkylightCount(blueprintData.skylightCount || (blueprintData.features?.skylights?.length ?? 0));
+        setVentCount(blueprintData.ventCount || (blueprintData.features?.vents?.length ?? 0));
       } else {
         result = buildFromMapPolygon(roofPolygon, obstacles, mats, scene, ridgeLines || []);
       }
@@ -884,6 +923,8 @@ const EnhancedSolarPanel3D = ({ blueprintData, roofPolygon, obstacles, ridgeLine
       <div class="stat highlight"><div class="stat-label">Solar Panels</div><div class="stat-value">${panelCount}</div><div class="stat-unit">units</div></div>
       <div class="stat highlight"><div class="stat-label">System Size</div><div class="stat-value">${totalCapacity.toFixed(1)}</div><div class="stat-unit">kW</div></div>
       <div class="stat highlight"><div class="stat-label">Annual Output</div><div class="stat-value">${Math.round(annualKwhCalc).toLocaleString('en-IN')}</div><div class="stat-unit">kWh/year</div></div>
+      ${skylightCount > 0 ? `<div class="stat"><div class="stat-label">Skylights</div><div class="stat-value">${skylightCount}</div><div class="stat-unit">units</div></div>` : ''}
+      ${ventCount > 0 ? `<div class="stat"><div class="stat-label">Roof Vents</div><div class="stat-value">${ventCount}</div><div class="stat-unit">units</div></div>` : ''}
     </div>
   </div>
 
@@ -991,6 +1032,8 @@ const EnhancedSolarPanel3D = ({ blueprintData, roofPolygon, obstacles, ridgeLine
               ['System Size',   totalCapacity.toFixed(1) + ' kW'],
               ['Annual Output', Math.round(annualKwh).toLocaleString('en-IN') + ' kWh'],
               ['Est. Savings',  'Rs. ' + savingsLakh.toFixed(2) + ' L/yr'],
+              ...(skylightCount > 0 ? [['Skylights', skylightCount + ' units']] : []),
+              ...(ventCount     > 0 ? [['Vents',     ventCount     + ' units']] : []),
             ].map(([label, val]) => (
               <div key={label} style={{
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',

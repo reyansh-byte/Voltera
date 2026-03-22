@@ -616,11 +616,32 @@ const EnhancedBlueprintTracer = ({ blueprintImage, onComplete }) => {
 
       // Convert ridge/valley lines from canvas pixels → real-world feet
       // const toReal = p => ({ x: (p.x / cW) * w, y: (p.y / cH) * l });
-      const realRidgeLines = ridgeLines.map(rl => ({
-        type: rl.type,
-        x1: (rl.x1 / cW) * w, y1: (rl.y1 / cH) * l,
-        x2: (rl.x2 / cW) * w, y2: (rl.y2 / cH) * l,
-      }));
+      // Only ridge lines are passed to 3D — valley lines are drawn on canvas
+      // for reference but not used in geometry
+      const realRidgeLines = ridgeLines
+        .filter(rl => rl.type === 'ridge')
+        .map(rl => ({
+          type: 'ridge',
+          x1: (rl.x1 / cW) * w, y1: (rl.y1 / cH) * l,
+          x2: (rl.x2 / cW) * w, y2: (rl.y2 / cH) * l,
+        }));
+
+      // Chimneys: preserve actual drawn position (centre of drawn rectangle)
+      const realChimneys = obstacles
+        .filter(o => o.type === 'chimney')
+        .map(o => {
+          const cx = o.pts.reduce((s, p) => s + p.x, 0) / o.pts.length;
+          const cy = o.pts.reduce((s, p) => s + p.y, 0) / o.pts.length;
+          const pw = Math.abs(o.pts[1].x - o.pts[0].x);
+          const ph = Math.abs(o.pts[2].y - o.pts[1].y);
+          return {
+            type: 'standard',
+            x: (cx / cW) * w,
+            y: (cy / cH) * l,
+            width:  (pw / cW) * w,
+            length: (ph / cH) * l,
+          };
+        });
 
       result = {
         polygon:           pts.map(p => ({ x: (p.x / cW) * w, y: (p.y / cH) * l })),
@@ -633,8 +654,10 @@ const EnhancedBlueprintTracer = ({ blueprintImage, onComplete }) => {
         wallHeight:        10,
         storeys:           1,
         ridgeLines:        realRidgeLines,
+        skylightCount: obstacles.filter(o => o.type === 'skylight').length,
+        ventCount:     obstacles.filter(o => o.type === 'vent').length,
         features: {
-          chimneys:  obstacles.filter(o => o.type === 'chimney').map(() => ({ type: 'standard' })),
+          chimneys:  realChimneys,
           skylights: obstacles.filter(o => o.type === 'skylight').map(() => ({ width: 3, length: 4 })),
           vents:     obstacles.filter(o => o.type === 'vent').map(() => ({})),
           dormers:   [],
@@ -713,7 +736,6 @@ const EnhancedBlueprintTracer = ({ blueprintImage, onComplete }) => {
           {[
             { id: 'outline',  label: '✏ Roof Outline', color: '#64c8ff' },
             { id: 'ridge',    label: '📐 Ridge Line',  color: '#ff6600' },
-            { id: 'valley',   label: '〰 Valley Line', color: '#00bbff' },
             { id: 'chimney',  label: '🧱 Chimney',     color: '#ff4444' },
             { id: 'skylight', label: '🪟 Skylight',    color: '#ffe030' },
             { id: 'vent',     label: '⭕ Vent',         color: '#ff8c00' },
@@ -805,9 +827,11 @@ const EnhancedBlueprintTracer = ({ blueprintImage, onComplete }) => {
             {manualMode
               ? drawingTool === 'outline'
                 ? '✏ Click roof corners clockwise • Undo removes last'
-                : (drawingTool === 'ridge' || drawingTool === 'valley')
-                  ? ridgeStart ? `Click 2nd point to complete ${drawingTool}` : `Click 1st point of ${drawingTool} line`
-                  : `Click twice to place ${drawingTool} rectangle`
+                : drawingTool === 'ridge'
+                  ? ridgeStart ? 'Click 2nd point to complete ridge line' : 'Click 1st point of ridge line'
+                  : drawingTool === 'skylight' || drawingTool === 'vent'
+                    ? `Click twice to mark ${drawingTool} area (counted only)`
+                    : `Click twice to place ${drawingTool} rectangle`
               : '↕ Drag handles • Right-click deletes • Click edge dot adds point'}
           </div>
         )}
@@ -861,8 +885,6 @@ const EnhancedBlueprintTracer = ({ blueprintImage, onComplete }) => {
       <div style={{ marginTop: 10, padding: '10px 14px', background: 'rgba(255,255,255,0.04)', borderRadius: 6, fontSize: 11, color: 'rgba(255,255,255,0.5)', lineHeight: 1.7 }}>
         <strong style={{ color: 'rgba(255,255,255,0.75)' }}>How it works</strong>
         <ul style={{ margin: '4px 0 0', paddingLeft: 16 }}>
-          <li>AI visually recognises roof shape — no text/OCR scanning</li>
-          <li>Detects complex shapes: L-shaped, T-shaped, irregular roofs</li>
           <li>Blue handles = corners — drag to refine position</li>
           <li>Click a midpoint dot on an edge to insert a new corner</li>
           <li>Right-click a corner handle to delete it</li>
